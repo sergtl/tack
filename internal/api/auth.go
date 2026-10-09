@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type RegisterRequest struct {
@@ -261,4 +263,66 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 	http.SetCookie(w, &cookie)
 	w.WriteHeader(http.StatusOK)
+}
+
+func RequireSession(db *pgxpool.Pool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cookie, err := r.Cookie("session")
+
+			log.Printf("AUTH MIDDLEWARE")
+
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": "Unauthorized",
+				})
+				return
+			}
+
+			tokenHash := hashToken(cookie.Value)
+
+			var userId int
+			var expiresAt time.Time
+
+			if err := db.QueryRow(
+				r.Context(),
+				"SELECT user_id, expires_at FROM sessions WHERE token_hash = $1",
+				tokenHash,
+			).Scan(&userId, &expiresAt); err != nil {
+				if errors.Is(pgx.ErrNoRows, err) {
+					// session not found
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnauthorized)
+					json.NewEncoder(w).Encode(map[string]string{
+						"error": "Unauthorized",
+					})
+					return
+				}
+
+				// some other err with finding session
+				// return some other error? or unauthorized?
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": "Unauthorized",
+				})
+				return
+			}
+
+			if !expiresAt.After(time.Now()) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": "Session expired",
+				})
+				return
+			}
+
+			ctx := context.WithValue(r.Context(), "userID", userId)
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
 }
