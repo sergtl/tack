@@ -25,5 +25,5 @@ func main() {
 
 	handler := api.NewHandler(pool)
 
-	http.ListenAndServe(":3000", handler.Routes())
+	http.ListenAndServe(":4000", handler.Routes())
 }

@@ -3,21 +3,29 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/go-chi/render"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type contextKey int
+
+const userIDKey contextKey = iota
+
 type RegisterRequest struct {
-	Name     string `json:"name" validate:"required"`
-	Email    string `json:"email" validate:"required,email"`
-	Password string `json:"password" validate:"required"`
+	Name          string `json:"name" validate:"required"`
+	Email         string `json:"email" validate:"required,email"`
+	Password      string `json:"password" validate:"required"`
+	WorkspaceName string `json:"workspace" validate:"required"`
 }
 
 type LoginRequest struct {
@@ -25,6 +33,10 @@ type LoginRequest struct {
 	Password string `json:"password" validate:"required"`
 }
 
+// TODO - add workspace creation in here
+// every registration will create a new workspace for the user
+// collaboration/joining existing orgs will come later
+// right now, "new user" = "new org"
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	var payload RegisterRequest
 
@@ -34,9 +46,8 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	if err := decoder.Decode(&payload); err != nil {
 		log.Printf("invalid json body: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, map[string]string{
 			"error": "Invalid JSON body",
 		})
 		return
@@ -45,9 +56,8 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	if err := h.validate.Struct(payload); err != nil {
 		log.Printf("could not validate the payload struct: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, map[string]string{
 			"error": "Invalid register fields",
 		})
 		return
@@ -58,43 +68,76 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("error hashing the password: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
 			"error": "Something went wrong",
 		})
 		return
 	}
 
+	suffix, err := randomSuffix()
+	if err != nil {
+		log.Printf("could not generate slug suffix: %v", err)
+
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
+			"error": "Something went wrong",
+		})
+		return
+	}
+
+	baseSlug := strings.ReplaceAll(strings.ToLower(payload.WorkspaceName), " ", "-")
+
+	slug := baseSlug + "-" + suffix
+
 	tx, err := h.DB.Begin(r.Context())
 	if err != nil {
 		log.Printf("could not start the transaction: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
 			"error": "Something went wrong",
 		})
 		return
 	}
 	defer tx.Rollback(r.Context())
 
+	var workspaceID string
+
+	if err := tx.QueryRow(
+		r.Context(),
+		`INSERT INTO workspaces (name, slug)
+		 VALUES ($1, $2)
+		 RETURNING id`,
+		payload.WorkspaceName,
+		slug,
+	).Scan(&workspaceID); err != nil {
+		log.Printf("could not create workspace for the user: %v", err)
+
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
+			"error": "Something went wrong",
+		})
+	}
+
+	log.Printf("created new org with id: %v", workspaceID)
+
 	var id int
 	if err := tx.QueryRow(
 		r.Context(),
-		"INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id",
+		"INSERT INTO users (name, email, password, workspace_id) VALUES ($1, $2, $3, $4) RETURNING id",
 		payload.Name,
 		payload.Email,
 		hash,
+		workspaceID,
 	).Scan(&id); err != nil {
 		var pgErr *pgconn.PgError
 
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "users_email_key" {
 			log.Printf("email already exists")
 
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(map[string]string{
+			render.Status(r, http.StatusConflict)
+			render.JSON(w, r, map[string]string{
 				"error": "Email already registered",
 			})
 			return
@@ -102,9 +145,8 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf("could not insert new user: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
 			"error": "Something went wrong",
 		})
 		return
@@ -125,9 +167,8 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	); err != nil {
 		log.Printf("failed to create session during registration: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
 			"error": "Something went wrong",
 		})
 		return
@@ -136,9 +177,8 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	if err := tx.Commit(r.Context()); err != nil {
 		log.Printf("failed to commit registration transaction: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
 			"error": "Something went wrong",
 		})
 		return
@@ -155,7 +195,11 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.SetCookie(w, &cookie)
-	w.WriteHeader(http.StatusCreated)
+
+	render.Status(r, http.StatusOK)
+	render.JSON(w, r, map[string]string{
+		"status": "Ok",
+	})
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
@@ -167,9 +211,8 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	if err := decoder.Decode(&payload); err != nil {
 		log.Printf("invalid json body: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, map[string]string{
 			"error": "Invalid JSON body",
 		})
 		return
@@ -178,9 +221,8 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	if err := h.validate.Struct(payload); err != nil {
 		log.Printf("could not validate the payload struct: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, map[string]string{
 			"error": "Invalid login fields",
 		})
 		return
@@ -196,9 +238,8 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, pgx.ErrNoRows) {
 			log.Printf("user not found")
 
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{
+			render.Status(r, http.StatusUnauthorized)
+			render.JSON(w, r, map[string]string{
 				"error": "Invalid email or password",
 			})
 			return
@@ -206,9 +247,8 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf("failed to fetch user during login: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
 			"error": "Something went wrong",
 		})
 		return
@@ -222,7 +262,9 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{
+
+		render.Status(r, http.StatusUnauthorized)
+		render.JSON(w, r, map[string]string{
 			"error": "Invalid email or password",
 		})
 		return
@@ -243,9 +285,8 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	); err != nil {
 		log.Printf("failed to create session during login: %v", err)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
 			"error": "Something went wrong",
 		})
 		return
@@ -262,7 +303,11 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.SetCookie(w, &cookie)
-	w.WriteHeader(http.StatusOK)
+	render.Status(r, http.StatusOK)
+	render.JSON(w, r, map[string]string{
+		"status": "Ok",
+	})
+	// w.WriteHeader(http.StatusOK)
 }
 
 func RequireSession(db *pgxpool.Pool) func(http.Handler) http.Handler {
@@ -273,9 +318,8 @@ func RequireSession(db *pgxpool.Pool) func(http.Handler) http.Handler {
 			log.Printf("AUTH MIDDLEWARE")
 
 			if err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
-				json.NewEncoder(w).Encode(map[string]string{
+				render.Status(r, http.StatusUnauthorized)
+				render.JSON(w, r, map[string]string{
 					"error": "Unauthorized",
 				})
 				return
@@ -293,9 +337,8 @@ func RequireSession(db *pgxpool.Pool) func(http.Handler) http.Handler {
 			).Scan(&userId, &expiresAt); err != nil {
 				if errors.Is(pgx.ErrNoRows, err) {
 					// session not found
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusUnauthorized)
-					json.NewEncoder(w).Encode(map[string]string{
+					render.Status(r, http.StatusUnauthorized)
+					render.JSON(w, r, map[string]string{
 						"error": "Unauthorized",
 					})
 					return
@@ -303,26 +346,40 @@ func RequireSession(db *pgxpool.Pool) func(http.Handler) http.Handler {
 
 				// some other err with finding session
 				// return some other error? or unauthorized?
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
-				json.NewEncoder(w).Encode(map[string]string{
+				render.Status(r, http.StatusUnauthorized)
+				render.JSON(w, r, map[string]string{
 					"error": "Unauthorized",
 				})
 				return
 			}
 
 			if !expiresAt.After(time.Now()) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
-				json.NewEncoder(w).Encode(map[string]string{
+				render.Status(r, http.StatusUnauthorized)
+				render.JSON(w, r, map[string]string{
 					"error": "Session expired",
 				})
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), "userID", userId)
+			// ctx := context.WithValue(r.Context(), "userID", userId)
+			ctx := context.WithValue(r.Context(), userIDKey, userId)
 
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+func UserIDFromContext(ctx context.Context) (int, bool) {
+	id, ok := ctx.Value(userIDKey).(int)
+	return id, ok
+}
+
+func randomSuffix() (string, error) {
+	b := make([]byte, 4)
+
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(b), nil
 }
