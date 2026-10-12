@@ -33,10 +33,6 @@ type LoginRequest struct {
 	Password string `json:"password" validate:"required"`
 }
 
-// TODO - add workspace creation in here
-// every registration will create a new workspace for the user
-// collaboration/joining existing orgs will come later
-// right now, "new user" = "new org"
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	var payload RegisterRequest
 
@@ -202,6 +198,68 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type MeResponse struct {
+	ID            int    `json:"id"`
+	Name          string `json:"name"`
+	Email         string `json:"email"`
+	WorkspaceName string `json:"workspace_name"`
+	WorkspaceSlug string `json:"workspace_slug"`
+}
+
+func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+
+	if !ok {
+		render.Status(r, http.StatusUnauthorized)
+		render.JSON(w, r, map[string]string{
+			"error": "Authentication required",
+		})
+		return
+	}
+
+	var me MeResponse
+
+	err := h.DB.QueryRow(
+		r.Context(),
+		`SELECT u.id, u.name, u.email, w.name, w.slug
+		 FROM users AS u
+		 JOIN workspaces AS w ON u.workspace_id = w.id
+		 WHERE u.id = $1`,
+		userID,
+	).Scan(
+		&me.ID,
+		&me.Name,
+		&me.Email,
+		&me.WorkspaceName,
+		&me.WorkspaceSlug,
+	)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			log.Printf("user left join workspaces failed: %v", err)
+
+			render.Status(r, http.StatusUnauthorized)
+			render.JSON(w, r, map[string]string{
+				"error": "User not found",
+			})
+			return
+		}
+
+		log.Printf("fetch current user: %v", err)
+
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
+			"error": "Something went wrong",
+		})
+		return
+	}
+
+	render.Status(r, http.StatusOK)
+	render.JSON(w, r, map[string]MeResponse{
+		"me": me,
+	})
+}
+
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	var payload LoginRequest
 
@@ -307,7 +365,6 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, r, map[string]string{
 		"status": "Ok",
 	})
-	// w.WriteHeader(http.StatusOK)
 }
 
 func RequireSession(db *pgxpool.Pool) func(http.Handler) http.Handler {
@@ -318,9 +375,22 @@ func RequireSession(db *pgxpool.Pool) func(http.Handler) http.Handler {
 			log.Printf("AUTH MIDDLEWARE")
 
 			if err != nil {
+
+				// delete
+				cookie := http.Cookie{
+					Name:     "session",
+					Value:    "",
+					Path:     "/",
+					MaxAge:   -1,
+					HttpOnly: true,
+					Secure:   true,
+					SameSite: http.SameSiteLaxMode,
+				}
+				http.SetCookie(w, &cookie)
+
 				render.Status(r, http.StatusUnauthorized)
 				render.JSON(w, r, map[string]string{
-					"error": "Unauthorized",
+					"error": "Session expired or invalid",
 				})
 				return
 			}
@@ -335,20 +405,28 @@ func RequireSession(db *pgxpool.Pool) func(http.Handler) http.Handler {
 				"SELECT user_id, expires_at FROM sessions WHERE token_hash = $1",
 				tokenHash,
 			).Scan(&userId, &expiresAt); err != nil {
+				cookie := http.Cookie{
+					Name:     "session",
+					Value:    "",
+					Path:     "/",
+					MaxAge:   -1,
+					HttpOnly: true,
+					Secure:   true,
+					SameSite: http.SameSiteLaxMode,
+				}
+				http.SetCookie(w, &cookie)
+
 				if errors.Is(pgx.ErrNoRows, err) {
-					// session not found
 					render.Status(r, http.StatusUnauthorized)
 					render.JSON(w, r, map[string]string{
-						"error": "Unauthorized",
+						"error": "Session expired or invalid",
 					})
 					return
 				}
 
-				// some other err with finding session
-				// return some other error? or unauthorized?
 				render.Status(r, http.StatusUnauthorized)
 				render.JSON(w, r, map[string]string{
-					"error": "Unauthorized",
+					"error": "Session expired or invalid",
 				})
 				return
 			}
@@ -356,12 +434,11 @@ func RequireSession(db *pgxpool.Pool) func(http.Handler) http.Handler {
 			if !expiresAt.After(time.Now()) {
 				render.Status(r, http.StatusUnauthorized)
 				render.JSON(w, r, map[string]string{
-					"error": "Session expired",
+					"error": "Session expired or invalid",
 				})
 				return
 			}
 
-			// ctx := context.WithValue(r.Context(), "userID", userId)
 			ctx := context.WithValue(r.Context(), userIDKey, userId)
 
 			next.ServeHTTP(w, r.WithContext(ctx))

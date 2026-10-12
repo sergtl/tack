@@ -23,7 +23,11 @@ func (h *Handler) Routes() http.Handler {
 
 	r.Group(func(protected chi.Router) {
 		protected.Use(RequireSession(h.DB))
+
+		protected.Get("/me", h.Me)
+
 		protected.Get("/issues", h.GetIssues)
+
 		protected.Post("/issues", h.CreateIssue)
 		protected.Post("/attach-issue", h.AttachIssueToProject)
 	})

@@ -198,7 +198,6 @@ type AttachIssueRequest struct {
 }
 
 func (h *Handler) AttachIssueToProject(w http.ResponseWriter, r *http.Request) {
-	// TODO
 	var payload AttachIssueRequest
 
 	if err := h.decodeAndValidate(r, &payload); err != nil {
