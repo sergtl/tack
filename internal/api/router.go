@@ -27,6 +27,7 @@ func (h *Handler) Routes() http.Handler {
 		protected.Get("/me", h.Me)
 
 		protected.Get("/issues", h.GetIssues)
+		protected.Get("/issues/{id}", h.GetIssue)
 
 		protected.Post("/issues", h.CreateIssue)
 		protected.Post("/attach-issue", h.AttachIssueToProject)

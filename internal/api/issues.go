@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
 )
 
@@ -93,10 +94,66 @@ func (h *Handler) GetIssues(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) GetIssue(w http.ResponseWriter, r *http.Request) {
+	issueId := chi.URLParam(r, "id")
+
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		render.Status(r, http.StatusUnauthorized)
+		render.JSON(w, r, map[string]string{
+			"error": "Authentication required",
+		})
+	}
+
+	var workspaceId int
+	var issue Issue
+
+	if err := h.DB.QueryRow(
+		r.Context(),
+		"SELECT workspace_id FROM users WHERE id = $1",
+		userID,
+	).Scan(&workspaceId); err != nil {
+
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
+			"error": "Something went wrong",
+		})
+		return
+	}
+
+	err := h.DB.QueryRow(
+		r.Context(),
+		`SELECT id, title, description, status FROM issues WHERE id = $1 AND workspace_id = $2`,
+		issueId,
+		workspaceId,
+	).Scan(&issue.ID, &issue.Title, &issue.Description, &issue.Status)
+
+	if err != nil {
+		log.Printf("could not fetch issue %v from the DB: %v", issueId, err)
+
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{
+			"error": "Something went wrong.",
+		})
+		return
+	}
+
+	render.Status(r, http.StatusOK)
+	render.JSON(w, r, map[string]Issue{
+		"data": issue,
+	})
+}
+
 type CreateIssueRequest struct {
 	Title       string `json:"title" validate:"required"`
 	Description string `json:"description"`
-	ProjectID   int    `json:"project_id"`
+	ProjectID   *int   `json:"project_id"`
+}
+
+type CreateIssueResponse struct {
+	Data struct {
+		ID int `json:"id"`
+	} `json:"data"`
 }
 
 func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
@@ -145,10 +202,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	response := CreateIssueResponse{}
+	response.Data.ID = id
+
 	render.Status(r, http.StatusCreated)
-	render.JSON(w, r, map[string]int{
-		"id": id,
-	})
+	render.JSON(w, r, response)
 }
 
 type DeleteIssueRequest struct {
