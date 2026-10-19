@@ -25,6 +25,7 @@ func (h *Handler) Routes() http.Handler {
 		protected.Use(RequireSession(h.DB))
 
 		protected.Get("/me", h.Me)
+		protected.Post("/logout", h.Logout)
 
 		protected.Get("/issues", h.GetIssues)
 		protected.Get("/issues/{id}", h.GetIssue)

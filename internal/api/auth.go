@@ -367,6 +367,48 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("session")
+	if err != nil && err != http.ErrNoCookie {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, map[string]string{
+			"error": "Invalid session cookie",
+		})
+		return
+	}
+
+	if err == nil {
+		tokenHash := hashToken(cookie.Value)
+
+		_, err := h.DB.Exec(r.Context(),
+			`DELETE FROM sessions WHERE token_hash = $1`,
+			tokenHash,
+		)
+
+		if err != nil {
+			log.Printf("failed to delete session/logout: %v", err)
+
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{
+				"error": "Something went wrong",
+			})
+			return
+		}
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+	})
+	render.Status(r, http.StatusOK)
+	render.JSON(w, r, map[string]string{
+		"status": "Ok",
+	})
+}
+
 func RequireSession(db *pgxpool.Pool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
