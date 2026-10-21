@@ -32,6 +32,8 @@ func (h *Handler) Routes() http.Handler {
 
 		protected.Post("/issues", h.CreateIssue)
 		protected.Post("/attach-issue", h.AttachIssueToProject)
+
+		protected.Patch("/issues/{id}", h.UpdateIssue)
 	})
 
 	r.Post("/register", h.Register)
